@@ -109,6 +109,7 @@ from ..ir import (
     FloatAttr,
     BF16Type,
     ComplexType,
+    FlatSymbolRefAttr,
     Float8E5M2Type,
     Float8E4M3FNType,
     Float8E5M2FNUZType,
@@ -608,6 +609,16 @@ class FxImporter:
         method to control access to mutable buffers and parameters. Without that, the
         default policy is to capture them as frozen values.
         """
+        # Import submodules as private functions
+        for submodule_name, submodule in prog.graph.owning_module.named_children():
+            subprog = submodule.graph
+            self.import_stateless_graph(
+                subprog,
+                func_name=submodule_name,
+                func_visibility="private",
+                import_symbolic_shape_expressions=import_symbolic_shape_expressions,
+            )
+
         # Create lookaside table of placeholders/outputs.
         placeholder_nodes: Dict[str, Node] = {}
         all_producer_nodes: Dict[str, Node] = {}
@@ -898,6 +909,16 @@ class FxImporter:
                 node.replace_all_uses_with(replacement)
                 g.erase_node(node)
 
+        # for each submodule ,import the graph as a private function
+        for name, submodule in prog.graph._owning_module._modules.items():
+            subprog = submodule.graph
+            self.import_stateless_graph(
+                subprog,
+                func_name=name,
+                func_visibility="private",
+                import_symbolic_shape_expressions=import_symbolic_shape_expressions,
+            )
+
         return self.import_stateless_graph(
             g,
             func_name=func_name,
@@ -1115,6 +1136,12 @@ class ContextCache:
                 isinstance(x, TorchFakeTensor) for x in val
             ):
                 return IrType.parse("!torch.list<vtensor>", context=self._c)
+            elif isinstance(val, tuple) and all(
+                isinstance(x, TorchFakeTensor) for x in val
+            ):
+                return tuple(
+                    self.get_vtensor_type(v.size(), v.dtype, val=v) for v in val
+                )
 
         # Note that None is a valid scalar here, so it is important that this
         # is always checked as the last fallback.
@@ -1569,6 +1596,90 @@ class GraphNodeImporter:
                 f"(tried '{handler_name}')"
             )
         handler(loc, node, hop)
+
+    def _import_hop_cond(
+        self, loc: Location, node: torch_fx.Node, hop: HigherOrderOperator
+    ):
+        """Imports the `cond` higher-order operator."""
+        # The `cond` op has the following signature:
+        # cond(pred, true_fn, false_fn, operands)
+        pred, true_fn, false_fn, operands = node.args
+
+        # Resolve the predicate value
+        pred_value = self._import_argument(loc, pred)
+
+        # Convert the predicate value to Torch BoolType if necessary
+        if pred_value.type != self._cc.torch_bool_type:
+            pred_value = Operation.create(
+                "torch.aten.Bool.Tensor",
+                results=[self._cc.torch_bool_type],
+                operands=[pred_value],
+                loc=loc,
+            ).result
+
+        # Resolve the operands
+        operand_values = [self._import_argument(loc, operand) for operand in operands]
+
+        # Resolve the true_fn and false_fn
+        true_fn_name = true_fn.target
+        false_fn_name = false_fn.target
+
+        # Create the `torch.prim.If` operation
+        result_types = self._cc.node_val_to_type(node)
+        operation = Operation.create(
+            "torch.prim.If",
+            results=result_types,
+            operands=[pred_value],
+            attributes={
+                "true_fn": StringAttr.get(true_fn_name),
+                "false_fn": StringAttr.get(false_fn_name),
+            },
+            loc=loc,
+            regions=2,
+        )
+        with InsertionPoint(self._b):
+            self._b.append(operation)
+
+        # Bind the result values
+        self._multi_result_nodes.add(node)
+        for i, value in enumerate(operation.results):
+            self.bind_node_value(node, value, i)
+
+        # Insert calls to the true_fn and false_fn in their own blocks
+        true_block = Block.create_at_start(operation.regions[0])
+        true_fn_call = func_dialect.CallOp(
+            calleeOrResults=result_types,
+            argumentsOrCallee=FlatSymbolRefAttr.get(true_fn_name),
+            arguments=operand_values,
+            loc=loc,
+        )
+        # insert torch yield
+        true_fn_terminator = Operation.create(
+            "torch.prim.If.yield",
+            operands=true_fn_call.results,
+            loc=loc,
+        )
+        with InsertionPoint(true_block):
+            true_block.append(true_fn_call)
+            true_block.append(true_fn_terminator)
+
+        false_block = Block.create_at_start(operation.regions[1])
+        false_fn_call = func_dialect.CallOp(
+            calleeOrResults=result_types,
+            argumentsOrCallee=FlatSymbolRefAttr.get(false_fn_name),
+            arguments=operand_values,
+            loc=loc,
+        )
+        # insert torch yield
+        false_fn_terminator = Operation.create(
+            "torch.prim.If.yield",
+            operands=false_fn_call.results,
+            loc=loc,
+        )
+
+        with InsertionPoint(false_block):
+            false_block.append(false_fn_call)
+            false_block.append(false_fn_terminator)
 
     def _import_hop_auto_functionalized(
         self, loc: Location, node: torch_fx.Node, hop: HigherOrderOperator
