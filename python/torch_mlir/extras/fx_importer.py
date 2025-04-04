@@ -38,6 +38,7 @@ import numpy as np
 import torch
 import torch.export
 import torch.fx as torch_fx
+from torch.fx.interpreter import tqdm
 from torch.fx.passes.shape_prop import TensorMetadata
 
 from torch import (
@@ -109,6 +110,7 @@ from ..ir import (
     FloatAttr,
     BF16Type,
     ComplexType,
+    FlatSymbolRefAttr,
     Float8E5M2Type,
     Float8E4M3FNType,
     Float8E5M2FNUZType,
@@ -134,7 +136,6 @@ from ..ir import (
 from ..dialects import (
     func as func_dialect,
 )
-
 
 __all__ = [
     "FxImporter",
@@ -577,6 +578,19 @@ class FxImporter:
     @property
     def module_op(self) -> Operation:
         return self._m.operation
+    
+    def import_submodules(self, graph: Graph, import_symbolic_shape_expressions: bool = False, parent_names: List[str] = []):
+        for submodule_name, submodule in graph.owning_module.named_children():
+            parent_names2 = parent_names.copy()
+            parent_names2.append(submodule_name)
+            self.import_submodules(submodule.graph, import_symbolic_shape_expressions=import_symbolic_shape_expressions, parent_names=parent_names2)
+            self.import_stateless_graph(
+                submodule.graph,
+                func_name=submodule_name,
+                func_visibility="private",
+                import_symbolic_shape_expressions=import_symbolic_shape_expressions,
+                parent_names=parent_names2[:-1]
+            )
 
     def import_program(
         self,
@@ -608,6 +622,9 @@ class FxImporter:
         method to control access to mutable buffers and parameters. Without that, the
         default policy is to capture them as frozen values.
         """
+        # Import submodules as private functions
+        self.import_submodules(prog.graph, import_symbolic_shape_expressions=import_symbolic_shape_expressions, parent_names=[func_name])
+
         # Create lookaside table of placeholders/outputs.
         placeholder_nodes: Dict[str, Node] = {}
         all_producer_nodes: Dict[str, Node] = {}
@@ -803,6 +820,7 @@ class FxImporter:
             all_producer_nodes.values(),
             skip_placeholders_outputs=True,
             import_symbolic_shape_expressions=import_symbolic_shape_expressions,
+            parent_names=["main"]
         )
         node_importer.return_node_values(loc, user_outputs)
         self.symbol_table.insert(func_op)
@@ -898,6 +916,10 @@ class FxImporter:
                 node.replace_all_uses_with(replacement)
                 g.erase_node(node)
 
+        self.import_submodules(
+            g, import_symbolic_shape_expressions=import_symbolic_shape_expressions, parent_names=[func_name]
+        )
+
         return self.import_stateless_graph(
             g,
             func_name=func_name,
@@ -920,19 +942,23 @@ class FxImporter:
         func_name: str = "main",
         func_visibility: Optional[str] = None,
         import_symbolic_shape_expressions: bool = False,
+        parent_names: Optional[List[str]] = None,
     ) -> Operation:
         """Low-level import of a functionalized, assumed stateless Graph as a func.
 
         TODO: This mechanism is deprecated by the `import_program` entry-point and
         it should be removed when no longer required for backwards compatibility.
         """
+        if parent_names is None:
+            parent_names = []
+
         ftype, loc = self._graph_to_function_meta(g)
         # TODO: The FuncOp constructor requires a context-manager context.
         # Fix upstream and then unnest.
         # See: https://github.com/nod-ai/SHARK-Turbine/issues/138
         with loc:
             func = func_dialect.FuncOp(
-                func_name,
+                "__".join(parent_names + [func_name]),
                 ftype,
                 ip=self._m_ip,
                 visibility=func_visibility,
@@ -945,7 +971,7 @@ class FxImporter:
             entry_block,
         )
         node_importer.import_nodes(
-            g.nodes, import_symbolic_shape_expressions=import_symbolic_shape_expressions
+            g.nodes, import_symbolic_shape_expressions=import_symbolic_shape_expressions, parent_names=parent_names+[func_name]
         )
         self.symbol_table.insert(func)
         return func
@@ -1115,6 +1141,12 @@ class ContextCache:
                 isinstance(x, TorchFakeTensor) for x in val
             ):
                 return IrType.parse("!torch.list<vtensor>", context=self._c)
+            elif isinstance(val, tuple) and all(
+                isinstance(x, TorchFakeTensor) for x in val
+            ):
+                return tuple(
+                    self.get_vtensor_type(v.size(), v.dtype, val=v) for v in val
+                )
 
         # Note that None is a valid scalar here, so it is important that this
         # is always checked as the last fallback.
@@ -1424,6 +1456,7 @@ class GraphNodeImporter:
         *,
         skip_placeholders_outputs: bool = False,
         import_symbolic_shape_expressions: bool = False,
+        parent_names: List[str] = [],
     ):
         with InsertionPoint(self._b):
             loc = Location.unknown()
@@ -1459,7 +1492,7 @@ class GraphNodeImporter:
                         # Dispatch to an ATen op.
                         self._import_torch_op_overload(loc, node)
                     elif isinstance(target, HigherOrderOperator):
-                        self._import_hop(loc, node, target)
+                        self._import_hop(loc, node, target, parent_names)
                     else:
                         raise NotImplementedError(
                             f"FIX ME: Unimplemented call_function: target={node.target}, {node.meta}"
@@ -1555,7 +1588,7 @@ class GraphNodeImporter:
         ), f"Unable to parse symbolic operation: {target} with args {node.args}"
         self._import_torch_op_overload(loc, node, concrete_target)
 
-    def _import_hop(self, loc: Location, node: torch_fx.Node, hop: HigherOrderOperator):
+    def _import_hop(self, loc: Location, node: torch_fx.Node, hop: HigherOrderOperator, parent_names: List[str]):
         # Imports a higher-order operator.
         # See: https://dev-discuss.pytorch.org/t/higher-order-operators-2023-10/1565
         assert hop.namespace == "higher_order"
@@ -1568,10 +1601,94 @@ class GraphNodeImporter:
                 f"implemented in the FxImporter "
                 f"(tried '{handler_name}')"
             )
-        handler(loc, node, hop)
+        handler(loc, node, hop, parent_names)
+
+    def _import_hop_cond(
+        self, loc: Location, node: torch_fx.Node, hop: HigherOrderOperator, parent_names: List[str]
+    ):
+        """Imports the `cond` higher-order operator."""
+        # The `cond` op has the following signature:
+        # cond(pred, true_fn, false_fn, operands)
+        pred, true_fn, false_fn, operands = node.args
+
+        # Resolve the predicate value
+        pred_value = self._import_argument(loc, pred)
+
+        # Convert the predicate value to Torch BoolType if necessary
+        if pred_value.type != self._cc.torch_bool_type:
+            pred_value = Operation.create(
+                "torch.aten.Bool.Tensor",
+                results=[self._cc.torch_bool_type],
+                operands=[pred_value],
+                loc=loc,
+            ).result
+
+        # Resolve the operands
+        operand_values = [self._import_argument(loc, operand) for operand in operands]
+
+        # Resolve the true_fn and false_fn
+        true_fn_name = "__".join(parent_names+[true_fn.target])
+        false_fn_name = "__".join(parent_names+[false_fn.target])
+
+        # Create the `torch.prim.If` operation
+        result_types = self._cc.node_val_to_type(node)
+        operation = Operation.create(
+            "torch.prim.If",
+            results=result_types,
+            operands=[pred_value],
+            attributes={
+                "true_fn": StringAttr.get(true_fn_name),
+                "false_fn": StringAttr.get(false_fn_name),
+            },
+            loc=loc,
+            regions=2,
+        )
+        with InsertionPoint(self._b):
+            self._b.append(operation)
+
+        # Bind the result values
+        self._multi_result_nodes.add(node)
+        for i, value in enumerate(operation.results):
+            self.bind_node_value(node, value, i)
+
+        # Insert calls to the true_fn and false_fn in their own blocks
+        true_block = Block.create_at_start(operation.regions[0])
+        true_fn_call = func_dialect.CallOp(
+            calleeOrResults=result_types,
+            argumentsOrCallee=FlatSymbolRefAttr.get(true_fn_name),
+            arguments=operand_values,
+            loc=loc,
+        )
+        # insert torch yield
+        true_fn_terminator = Operation.create(
+            "torch.prim.If.yield",
+            operands=true_fn_call.results,
+            loc=loc,
+        )
+        with InsertionPoint(true_block):
+            true_block.append(true_fn_call)
+            true_block.append(true_fn_terminator)
+
+        false_block = Block.create_at_start(operation.regions[1])
+        false_fn_call = func_dialect.CallOp(
+            calleeOrResults=result_types,
+            argumentsOrCallee=FlatSymbolRefAttr.get(false_fn_name),
+            arguments=operand_values,
+            loc=loc,
+        )
+        # insert torch yield
+        false_fn_terminator = Operation.create(
+            "torch.prim.If.yield",
+            operands=false_fn_call.results,
+            loc=loc,
+        )
+
+        with InsertionPoint(false_block):
+            false_block.append(false_fn_call)
+            false_block.append(false_fn_terminator)
 
     def _import_hop_auto_functionalized(
-        self, loc: Location, node: torch_fx.Node, hop: HigherOrderOperator
+        self, loc: Location, node: torch_fx.Node, hop: HigherOrderOperator, parent_names: List[str] = []
     ):
         # Imports the torch._higher_order_ops.auto_functionalize.auto_functionalized HOP.
         # This op wraps a target OpOverload with args/kwargs dispatched to it.
